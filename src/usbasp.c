@@ -42,9 +42,9 @@
 
 #if defined(HAVE_LIBUSB) || defined(HAVE_LIBUSB_1_0)
 
-#ifdef HAVE_LIBUSB_1_0
-# define USE_LIBUSB_1_0
-#endif
+//#ifdef HAVE_LIBUSB_1_0
+//# define USE_LIBUSB_1_0
+//#endif
 
 #if defined(USE_LIBUSB_1_0)
 # if defined(HAVE_LIBUSB_1_0_LIBUSB_H)
@@ -535,12 +535,41 @@ static int           didUsbInit = 0;
 
 
 /* Interface - prog. */
-static int usbasp_open(PROGRAMMER *pgm, const char *port) {
-  pmsg_debug("usbasp_open(\"%s\")\n", port);
+static int usbasp_open(PROGRAMMER *pgm, const char *name) {
+  struct usb_bus      *bus;
+  struct usb_device   *dev = 0;
+  const char *bus_name = NULL;
+  char *dev_name = NULL;
+  int vid, pid;
 
-  /* usb_init will be done in usbOpenDevice */
+  pmsg_debug("usbasp_open(\"%s\")\n", name);
+
+  // if no -P was given or '-P usb' was given
+  if(strcmp(name, "usb") == 0)
+    name = NULL;
+  else {
+    // calculate bus and device names from -P option
+    const size_t usb_len = strlen("usb");
+    if(strncmp(name, "usb", usb_len) == 0 && ':' == name[usb_len]) {
+        bus_name = name + usb_len + 1;
+        dev_name = strchr(bus_name, ':');
+        if(NULL != dev_name)
+          *dev_name++ = '\0';
+    }
+  }
+
+  usb_init();                    // initialize the libusb system
+  usb_find_busses();             // have libusb scan all the usb buses available
+  usb_find_devices();            // have libusb scan all the usb devices available
+
+  PDATA(pgm)->usbhandle = NULL;
+
+  if (pgm->usbvid)
+    vid = pgm->usbvid;
+  else
+    vid = USBASP_SHARED_VID;
+
   LNODEID usbpid = lfirst(pgm->usbpid);
-  int pid, vid;
   if (usbpid) {
     pid = *(int *)(ldata(usbpid));
     if (lnext(usbpid))
@@ -548,44 +577,48 @@ static int usbasp_open(PROGRAMMER *pgm, const char *port) {
   } else {
     pid = USBASP_SHARED_PID;
   }
-  vid = pgm->usbvid? pgm->usbvid: USBASP_SHARED_VID;
-  if (usbOpenDevice(&PDATA(pgm)->usbhandle, vid, pgm->usbvendor, pid, pgm->usbproduct) != 0) {
-    /* try alternatives */
-    if(strcasecmp(ldata(lfirst(pgm->id)), "usbasp") == 0) {
-    /* for id usbasp autodetect some variants */
-      if(strcasecmp(port, "nibobee") == 0) {
-        pmsg_error("using -C usbasp -P nibobee is deprecated, use -C nibobee instead\n");
-        if (usbOpenDevice(&PDATA(pgm)->usbhandle, USBASP_NIBOBEE_VID, "www.nicai-systems.com",
-		        USBASP_NIBOBEE_PID, "NIBObee") != 0) {
-          pmsg_error("cannot find USB device NIBObee with vid=0x%x pid=0x%x\n",
-            USBASP_NIBOBEE_VID, USBASP_NIBOBEE_PID);
-          return -1;
-        }
-        return 0;
-      }
-      /* check if device with old VID/PID is available */
-      if (usbOpenDevice(&PDATA(pgm)->usbhandle, USBASP_OLD_VID, "www.fischl.de",
-		             USBASP_OLD_PID, "USBasp") == 0) {
-        /* found USBasp with old IDs */
-        pmsg_error("found USB device USBasp with old VID/PID; please update firmware of USBasp\n");
-	return 0;
-      }
-    /* original USBasp is specified in config file, so no need to check it again here */
-    /* no alternative found => fall through to generic error message */
-    }
 
-    pmsg_error("cannot find USB device with vid=0x%x pid=0x%x", vid, pid);
-    if (pgm->usbvendor[0] != 0) {
-       msg_error(" vendor='%s'", pgm->usbvendor);
+  // now we iterate through all the buses and devices
+  for ( bus = usb_busses; bus; bus = bus->next ) {
+    for	( dev = bus->devices; dev; dev = dev->next ) {
+      if (dev->descriptor.idVendor == vid
+	  && dev->descriptor.idProduct == pid ) {   // found match?
+        pmsg_notice("usbdev_open(): found USBasp, bus:device: %s:%s\n", bus->dirname, dev->filename);
+
+        // if -P was given, match device by device name and bus name
+        if(name != NULL &&
+          (NULL == dev_name ||
+           strcmp(bus->dirname, bus_name) ||
+           strcmp(dev->filename, dev_name))) {
+          pmsg_notice("usbdev_open(): skipping USBasp, bus:device: %s:%s\n", bus->dirname, dev->filename);
+          continue;
+        }
+
+        // attempt to connect to device
+        pmsg_notice("usbdev_open(): connecting to USBasp, bus:device: %s:%s\n", bus->dirname, dev->filename);
+        PDATA(pgm)->usbhandle = usb_open(dev);
+
+        // wrong permissions or something?
+        if (!PDATA(pgm)->usbhandle) {
+          pmsg_warning("cannot open USB device: %s\n", usb_strerror());
+        }
+        goto end_usb_iter;
+      }
     }
-    if (pgm->usbproduct[0] != 0) {
-       msg_error(" product='%s'", pgm->usbproduct);
-    }
-    msg_error("\n");
+  }
+end_usb_iter:
+
+  if(NULL != name && NULL == dev_name) {
+    pmsg_error("invalid -P value: '%s'\n", name);
+    imsg_error("use -P usb:bus:device\n");
+    return -1;
+  }
+  if (!PDATA(pgm)->usbhandle) {
+    pmsg_error("cannot find USBasp device (0x%x/0x%x)\n", vid, pid );
     return -1;
   }
 
-  return 0;
+  return 0;                  // If we got here, we must have found a good USB device
 }
 
 static void usbasp_close(PROGRAMMER * pgm)
